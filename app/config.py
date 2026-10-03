@@ -16,6 +16,14 @@ GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
 # Allowed lifetime window of a historical-revision lease (seconds).
 LEASE_MIN_TTL = int(os.environ.get("ORIGIN_LEASE_MIN_TTL", "60"))
 LEASE_MAX_TTL = int(os.environ.get("ORIGIN_LEASE_MAX_TTL", "86400"))
+# Object-index listings: default page size, hard maximum, snapshot lifetime.
+OBJECT_INDEX_DEFAULT_LIMIT = int(
+    os.environ.get("ORIGIN_OBJECT_INDEX_DEFAULT_LIMIT", "50")
+)
+OBJECT_INDEX_MAX_LIMIT = int(os.environ.get("ORIGIN_OBJECT_INDEX_MAX_LIMIT", "100"))
+OBJECT_INDEX_TTL_SECONDS = int(
+    os.environ.get("ORIGIN_OBJECT_INDEX_TTL_SECONDS", "600")
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
@@ -45,6 +53,12 @@ CREATE TABLE IF NOT EXISTS revisions (
                             DEFAULT date_trunc('second', now()),
     UNIQUE (object_path, revision_no)
 );
+
+-- Object-index prefix scans order and range paths as raw UTF-8 bytes
+-- (independent of the database collation): the expression index on
+-- path::bytea supports the half-open range [prefix, prefix_upper_bound).
+CREATE INDEX IF NOT EXISTS objects_path_bytea_idx
+    ON objects ((path::bytea));
 
 DO $$
 BEGIN
@@ -180,4 +194,47 @@ CREATE TABLE IF NOT EXISTS revision_leases (
 CREATE INDEX IF NOT EXISTS revision_leases_revision_active_idx
     ON revision_leases (revision_id)
     WHERE released_at IS NULL;
+
+-- Object-index snapshots (GET /object-index).  The first request of a
+-- listing freezes the current revisions matching its prefix -- paths in
+-- ascending byte order, with each revision's number, strong ETag, media
+-- type and byte length -- as a ten-minute snapshot; later pages only
+-- resume the snapshot its signed cursor names.
+--
+-- The frozen rows deliberately have NO foreign key to ``revisions`` and
+-- duplicate the ETag/media_type/length values rather than joining: a
+-- snapshot is a historical record, so PUTs, path moves (which detach the
+-- source row) and /gc reclamation of the very revisions the snapshot
+-- pinned must not change replay or pagination, and the listing never
+-- blocks a writer: the snapshot is one lock-free SELECT (no object or
+-- revision lock is ever taken), copied into these tables before commit.
+CREATE TABLE IF NOT EXISTS object_index_snapshots (
+    id         text PRIMARY KEY,
+    prefix     text NOT NULL,
+    limit_val  integer NOT NULL,
+    total      integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS object_index_snapshots_expires_idx
+    ON object_index_snapshots (expires_at);
+
+CREATE TABLE IF NOT EXISTS object_index_snapshot_entries (
+    snapshot_id text NOT NULL
+                     REFERENCES object_index_snapshots (id) ON DELETE CASCADE,
+    ordinal     bigint NOT NULL,
+    path        text NOT NULL,
+    revision_no bigint NOT NULL,
+    etag        text NOT NULL CHECK (char_length(etag) = 66),
+    media_type  text NOT NULL,
+    bytes       bigint NOT NULL,
+    PRIMARY KEY (snapshot_id, ordinal)
+);
+
+-- Every page fetch selects one page by ordinal; the covering index lets
+-- it read the page without touching the heap.
+CREATE INDEX IF NOT EXISTS object_index_snapshot_entries_page_idx
+    ON object_index_snapshot_entries (snapshot_id, ordinal)
+    INCLUDE (path, revision_no, etag, media_type, bytes);
 """

@@ -64,6 +64,16 @@ then share-locks its object row and only then re-checks lease liveness
 and revision existence; the transaction and share lock are held until
 the last streamed byte, so expiry/release during a read never tears the
 response, and a DELETE-based release is idempotent.
+
+Object-index snapshots (``GET /object-index``) take the opposite
+approach from every other reader: they never lock ``objects`` or
+``revisions`` at all.  One lock-free SELECT over the current revisions
+freezes path, revision number, quoted ETag, media type and byte length
+into dedicated snapshot tables, so the listing cannot block a PUT, move
+or GC and none of those can change its replay or pagination -- the
+frozen rows deliberately have no foreign key to ``revisions``, making
+them an independent historical record even when the pinned revisions
+are later moved away or reclaimed.
 """
 from __future__ import annotations
 
@@ -353,6 +363,7 @@ async def detach_object(conn: asyncpg.Connection, path: str) -> None:
 # ---- copy sessions -----------------------------------------------------------
 
 COPY_SECRET_KEY = "copy_cursor_secret"
+OBJECT_INDEX_SECRET_KEY = "object_index_cursor_secret"
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,27 +409,37 @@ class TargetBaseline:
     sha256: str | None
 
 
-async def ensure_copy_secret(pool: asyncpg.Pool) -> str:
-    """Return the HMAC key that signs copy cursors, creating it once.
+async def _ensure_meta_secret(pool: asyncpg.Pool, key: str) -> str:
+    """Return the HMAC secret stored under ``key``, creating it once.
 
-    The secret lives in the database so cursors stay valid across
+    The secret lives in the database so signed tokens stay valid across
     restarts; concurrent first-boots converge on whichever insert wins.
     """
     async with pool.acquire() as conn:
         secret = await conn.fetchval(
-            "SELECT value FROM service_meta WHERE key = $1", COPY_SECRET_KEY
+            "SELECT value FROM service_meta WHERE key = $1", key
         )
         if secret:
             return secret
         await conn.execute(
             "INSERT INTO service_meta (key, value) VALUES ($1, $2)"
             " ON CONFLICT (key) DO NOTHING",
-            COPY_SECRET_KEY,
+            key,
             secrets.token_hex(32),
         )
         return await conn.fetchval(
-            "SELECT value FROM service_meta WHERE key = $1", COPY_SECRET_KEY
+            "SELECT value FROM service_meta WHERE key = $1", key
         )
+
+
+async def ensure_copy_secret(pool: asyncpg.Pool) -> str:
+    """Return the HMAC key that signs copy cursors, creating it once."""
+    return await _ensure_meta_secret(pool, COPY_SECRET_KEY)
+
+
+async def ensure_object_index_secret(pool: asyncpg.Pool) -> str:
+    """Return the HMAC key that signs object-index cursors, creating once."""
+    return await _ensure_meta_secret(pool, OBJECT_INDEX_SECRET_KEY)
 
 
 async def snapshot_source_revisions(
@@ -1299,3 +1320,215 @@ async def release_revision_lease(conn: asyncpg.Connection, lease_id: str) -> str
         lease_id,
     )
     return "released_now" if updated is not None else "already_released"
+
+
+# ---- object-index snapshots --------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class IndexSnapshot:
+    """One frozen object-index listing.
+
+    ``total`` is the number of entries the scan captured; ``expired`` is
+    evaluated against the database clock at fetch time, so a page request
+    for an expired snapshot answers 410.
+    """
+
+    id: str
+    prefix: str
+    limit_val: int
+    total: int
+    created_at: datetime
+    expires_at: datetime
+    expired: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IndexEntry:
+    """One frozen (path, current revision) pair of a snapshot."""
+
+    ordinal: int
+    path: str
+    revision_no: int
+    etag: str
+    media_type: str
+    bytes_: int
+
+
+def _prefix_where(prefix: str):
+    """Range predicate + bound args for paths starting with ``prefix``.
+
+    Paths are ordered and matched as raw UTF-8 bytes: the predicate
+    casts ``path`` to ``bytea`` and scans the half-open range
+    ``[prefix_bytes, upper_bytes)`` on the ``objects_path_bytea_idx``
+    expression index, independent of the database's text collation.  The
+    upper bound is the encoded next code point (see
+    :func:`prefix_upper_bound`); ``None`` means "prefix has no finite
+    successor" (every path is at or above it), so only the lower bound
+    is needed.  With an empty prefix every live object matches.
+    """
+    if not prefix:
+        return "TRUE", ()
+    from .object_index import prefix_upper_bound
+
+    lower = prefix.encode("utf-8")
+    upper_text = prefix_upper_bound(prefix)
+    if upper_text is None:
+        return ("o.path::bytea >= $1", (lower,))
+    return (
+        "o.path::bytea >= $1 AND o.path::bytea < $2",
+        (lower, upper_text.encode("utf-8")),
+    )
+
+
+async def sweep_expired_index_snapshots(conn: asyncpg.Connection) -> None:
+    """Best-effort removal of snapshots past their expiry.
+
+    Runs inside the snapshot-creation transaction right before a new
+    snapshot is inserted, so the table cannot grow without bound.  It
+    deletes only ``object_index_snapshots`` rows (entry rows cascade) and
+    never touches ``objects``/``revisions``, so a listing cannot block or
+    be blocked by a writer.
+    """
+    await conn.execute(
+        "DELETE FROM object_index_snapshots WHERE expires_at <= now()"
+    )
+
+
+async def create_index_snapshot(
+    conn: asyncpg.Connection,
+    snapshot_id: str,
+    prefix: str,
+    limit_val: int,
+    ttl_seconds: int,
+) -> IndexSnapshot:
+    """Freeze the current revisions matching ``prefix``.
+
+    The scan is a single SELECT, so it reads from one statement
+    snapshot; the header stores ``len(rows)`` as ``total``, making the
+    header and the frozen entries consistent in any isolation level.
+    No object or revision lock is ever taken -- that is the point of the
+    frozen copy -- so a listing never blocks a PUT, move or /gc, and
+    those writers cannot change replay or pagination once this commits.
+    ETags are stored already quoted; replay needs neither the revision
+    row nor any join.
+    """
+    where, bound_args = _prefix_where(prefix)
+    rows = await conn.fetch(
+        f"""
+        SELECT o.path, r.revision_no, ('"' || r.sha256 || '"') AS etag,
+               r.media_type, octet_length(r.content) AS bytes
+          FROM objects o
+          JOIN revisions r ON r.id = o.current_id
+         WHERE {where}
+         ORDER BY o.path::bytea ASC
+        """,
+        *bound_args,
+    )
+    header = await conn.fetchrow(
+        """
+        INSERT INTO object_index_snapshots
+            (id, prefix, limit_val, total, expires_at)
+        VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+        RETURNING created_at, expires_at
+        """,
+        snapshot_id,
+        prefix,
+        limit_val,
+        len(rows),
+        ttl_seconds,
+    )
+    if rows:
+        await conn.executemany(
+            """
+            INSERT INTO object_index_snapshot_entries
+                (snapshot_id, ordinal, path, revision_no,
+                 etag, media_type, bytes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            [
+                (
+                    snapshot_id,
+                    ordinal,
+                    r["path"],
+                    r["revision_no"],
+                    r["etag"],
+                    r["media_type"],
+                    r["bytes"],
+                )
+                for ordinal, r in enumerate(rows)
+            ],
+        )
+    return IndexSnapshot(
+        id=snapshot_id,
+        prefix=prefix,
+        limit_val=limit_val,
+        total=len(rows),
+        created_at=header["created_at"],
+        expires_at=header["expires_at"],
+        expired=False,
+    )
+
+
+def _to_index_snapshot(row: asyncpg.Record) -> IndexSnapshot:
+    return IndexSnapshot(
+        id=row["id"],
+        prefix=row["prefix"],
+        limit_val=row["limit_val"],
+        total=row["total"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        expired=row["expired"],
+    )
+
+
+async def get_index_snapshot(
+    conn: asyncpg.Connection, snapshot_id: str
+) -> IndexSnapshot | None:
+    """Fetch a snapshot header with expiry evaluated on the DB clock.
+
+    The ``(expires_at <= now())`` flag is what turns a still-signed
+    cursor into a 410: a swept row answers 404-like-None (also mapped to
+    410 by the endpoint, since the signature was valid), a live row 200.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, prefix, limit_val, total, created_at, expires_at,
+               (expires_at <= now()) AS expired
+          FROM object_index_snapshots
+         WHERE id = $1
+        """,
+        snapshot_id,
+    )
+    return None if row is None else _to_index_snapshot(row)
+
+
+async def fetch_index_page(
+    conn: asyncpg.Connection,
+    snapshot_id: str,
+    offset: int,
+    limit_val: int,
+) -> list[IndexEntry]:
+    """One frozen page: dense ordinals [offset, offset + limit_val)."""
+    rows = await conn.fetch(
+        """
+        SELECT ordinal, path, revision_no, etag, media_type, bytes
+          FROM object_index_snapshot_entries
+         WHERE snapshot_id = $1 AND ordinal >= $2 AND ordinal < $3
+         ORDER BY ordinal ASC
+        """,
+        snapshot_id,
+        offset,
+        offset + limit_val,
+    )
+    return [
+        IndexEntry(
+            ordinal=r["ordinal"],
+            path=r["path"],
+            revision_no=r["revision_no"],
+            etag=r["etag"],
+            media_type=r["media_type"],
+            bytes_=r["bytes"],
+        )
+        for r in rows
+    ]

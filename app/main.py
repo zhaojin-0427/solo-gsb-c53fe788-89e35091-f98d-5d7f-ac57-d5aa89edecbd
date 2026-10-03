@@ -42,6 +42,17 @@ new target revision and detaches the source (its GET/HEAD become 404).
 A per-path revision high-water mark keeps numbers monotonic when a
 moved-away path is later re-PUT or reused as a target, even after /gc
 has removed every leftover revision.
+
+Object-index listings (``GET /object-index``) answer the first request
+of a listing by freezing the current revisions matching its prefix --
+paths in ascending order, with revision number, strong ETag, media type
+and byte length -- as a ten-minute snapshot, returning the first page
+and a signed next_cursor.  Later pages only resume the snapshot the
+cursor names (its signature binds prefix, limit, snapshot id and
+offset): tampering answers 400, an expired or swept snapshot 410.  The
+frozen rows have no link back to ``revisions`` and the scan takes no
+object or revision locks, so PUTs, moves and GC neither block on a
+listing nor change its replay or pagination.
 """
 from __future__ import annotations
 
@@ -65,6 +76,9 @@ from .config import (
     GC_MAX_PATHS,
     LEASE_MAX_TTL,
     LEASE_MIN_TTL,
+    OBJECT_INDEX_DEFAULT_LIMIT,
+    OBJECT_INDEX_MAX_LIMIT,
+    OBJECT_INDEX_TTL_SECONDS,
 )
 from .copy_sessions import (
     CopyCursor,
@@ -76,6 +90,11 @@ from .copy_sessions import (
 )
 from .dates import http_date, parse_http_date
 from .etags import make_etag, parse_etag
+from .object_index import (
+    IndexCursor,
+    decode_index_cursor,
+    encode_index_cursor,
+)
 from .preconditions import (
     Outcome,
     RequestConditions,
@@ -180,6 +199,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     dsn = os.environ.get("DATABASE_URL", DATABASE_URL)
     app.state.pool = await database.create_pool(dsn)
     app.state.copy_secret = await database.ensure_copy_secret(app.state.pool)
+    app.state.index_secret = await database.ensure_object_index_secret(
+        app.state.pool
+    )
     try:
         yield
     finally:
@@ -1388,3 +1410,171 @@ async def delete_revision_lease(lease_id: str, request: Request):
             status_code=404,
         )
     return Response(status_code=204)
+
+
+# ---- object index (snapshot listings) -----------------------------------------
+
+
+def _index_bad_request(detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=400)
+
+
+def _parse_index_limit(raw: str | None):
+    """Parse the ``limit`` query parameter: 1..100, default 50.
+
+    Returns (limit, None) or (None, JSONResponse) for malformed values
+    (floats, signs, whitespace-bearing or non-numeric text are all 400).
+    """
+    if raw is None:
+        return OBJECT_INDEX_DEFAULT_LIMIT, None
+    # int() would accept "+5", spaces or underscores; keep the accepted
+    # spellings to plain decimal digits only.
+    if not raw.isdigit():
+        return None, _index_bad_request(
+            f"limit must be an integer in [1, {OBJECT_INDEX_MAX_LIMIT}]"
+        )
+    value = int(raw)
+    if not 1 <= value <= OBJECT_INDEX_MAX_LIMIT:
+        return None, _index_bad_request(
+            f"limit must be an integer in [1, {OBJECT_INDEX_MAX_LIMIT}]"
+        )
+    return value, None
+
+
+def _index_entry_json(entry) -> dict:
+    return {
+        "path": entry.path,
+        "revision_no": entry.revision_no,
+        "etag": entry.etag,
+        "media_type": entry.media_type,
+        "bytes": entry.bytes_,
+    }
+
+
+def _index_page_json(
+    snapshot, entries, limit: int, next_offset: int | None, secret: str
+) -> dict:
+    return {
+        "prefix": snapshot.prefix,
+        "limit": limit,
+        "entries": [_index_entry_json(e) for e in entries],
+        "next_cursor": (
+            None
+            if next_offset is None
+            else encode_index_cursor(
+                secret,
+                IndexCursor(
+                    snapshot_id=snapshot.id,
+                    prefix=snapshot.prefix,
+                    limit=limit,
+                    offset=next_offset,
+                ),
+            )
+        ),
+        "snapshot": {
+            "id": snapshot.id,
+            "total": snapshot.total,
+            "created_at": snapshot.created_at.isoformat(),
+            "expires_at": snapshot.expires_at.isoformat(),
+        },
+    }
+
+
+_INDEX_HEADERS = {"Cache-Control": "no-store"}
+
+
+@app.get("/object-index")
+async def list_object_index(request: Request):
+    """List current revisions as a frozen, cursor-paginated snapshot.
+
+    The first request (no ``cursor``) scans the objects matching
+    ``prefix`` in ascending path order and freezes each one's path,
+    revision number, strong ETag, media type and byte length as a
+    ten-minute snapshot; it returns the first ``limit`` entries and an
+    opaque signed ``next_cursor``.  Following requests present that
+    cursor: the signature binds prefix, limit, snapshot id and offset,
+    so a tampered cursor answers 400, while a cursor whose snapshot has
+    expired (or been swept) answers 410.
+
+    The frozen rows live in their own tables with no foreign key to
+    ``revisions``; the snapshot is taken without a single object or
+    revision lock, so PUTs, path moves and /gc never block on a listing
+    and can never change its replay or pagination -- pages are dense,
+    ascending ordinals, hence never duplicated or skipped.  An empty
+    ``prefix`` lists every object.
+    """
+    pool = request.app.state.pool
+    secret = request.app.state.index_secret
+    raw_cursor = request.query_params.get("cursor")
+    raw_prefix = request.query_params.get("prefix")
+    raw_limit = request.query_params.get("limit")
+
+    if raw_cursor is not None:
+        cur = decode_index_cursor(secret, raw_cursor)
+        if cur is None:
+            return _index_bad_request("invalid cursor")
+        # The query string may echo the bound parameters (e.g. clients
+        # that always resend prefix/limit); any divergence is a forged or
+        # mismatched cursor and answers 400.
+        if raw_prefix is not None and raw_prefix != cur.prefix:
+            return _index_bad_request("cursor does not match prefix")
+        if raw_limit is not None:
+            bound, bad = _parse_index_limit(raw_limit)
+            if bad is not None:
+                return bad
+            if bound != cur.limit:
+                return _index_bad_request("cursor does not match limit")
+
+        async with pool.acquire() as conn:
+            snapshot = await database.get_index_snapshot(conn, cur.snapshot_id)
+            if snapshot is None or snapshot.expired:
+                return JSONResponse(
+                    {
+                        "detail": "snapshot_expired",
+                        "snapshot_id": cur.snapshot_id,
+                    },
+                    status_code=410,
+                )
+            if snapshot.prefix != cur.prefix or snapshot.limit_val != cur.limit:
+                return _index_bad_request("invalid cursor")
+            if cur.offset > snapshot.total:
+                return _index_bad_request("invalid cursor")
+            entries = await database.fetch_index_page(
+                conn, snapshot.id, cur.offset, cur.limit
+            )
+
+        next_offset = (
+            cur.offset + len(entries)
+            if cur.offset + len(entries) < snapshot.total
+            else None
+        )
+        body = _index_page_json(
+            snapshot, entries, cur.limit, next_offset, secret
+        )
+        return JSONResponse(body, headers=_INDEX_HEADERS)
+
+    # First page: freeze the listing now.
+    prefix = raw_prefix if raw_prefix is not None else ""
+    limit, bad = _parse_index_limit(raw_limit)
+    if bad is not None:
+        return bad
+
+    snapshot_id = uuid.uuid4().hex
+    # READ COMMITTED is enough: the object scan is a single SELECT (one
+    # statement snapshot of its own) and ``total`` is exactly the number
+    # of rows that scan returned, so the header always matches the frozen
+    # entries without a second read.  Crucially NO FOR SHARE/FOR UPDATE
+    # lock is taken on objects or revisions, so writers never wait on the
+    # listing; the only writes here are the new snapshot rows and the
+    # expiry sweep on our own table, which never conflict with writers.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await database.sweep_expired_index_snapshots(conn)
+            snapshot = await database.create_index_snapshot(
+                conn, snapshot_id, prefix, limit, OBJECT_INDEX_TTL_SECONDS
+            )
+            entries = await database.fetch_index_page(conn, snapshot_id, 0, limit)
+
+    next_offset = limit if limit < snapshot.total else None
+    body = _index_page_json(snapshot, entries, limit, next_offset, secret)
+    return JSONResponse(body, headers=_INDEX_HEADERS)
