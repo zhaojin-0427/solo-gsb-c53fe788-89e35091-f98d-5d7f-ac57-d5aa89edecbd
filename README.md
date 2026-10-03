@@ -16,6 +16,7 @@
 - **历史修订回收**：`POST /gc` 提交 1～100 个对象路径（服务去重）、UTC 截止时间 `before` 与布尔 `dry_run`；只考虑创建时间**严格早于** `before` 的修订，且**当前修订、复制会话清单或目标基线引用的修订、有效历史修订租约引用的修订一律保留**。`dry_run`（缺省 `true`）在可重复读快照中按路径排序返回候选修订号、可释放字节数与被保留修订的原因（含 `revision_lease`），不改数据；`dry_run=false` 按固定路径升序锁定全部对象行，在**同一事务内重新判定并删除**，整批成功或回滚——与 PUT、复制会话建档/确认、租约创建、流式 GET 并发时不会误删在用修订或留下悬空引用；重复执行返回空清单，后续发布的修订号仍递增。**已迁走的路径**（`POST /moves`）没有当前修订但仍保留修订历史，同样可以被回收：未被任何会话或租约引用的旧修订正常清理，而会话清单/基线/有效租约钉住的修订一律保留。
 - **历史修订租约**：`POST /revision-leases` 提交 `path`、**正整数** `revision_no` 与 `ttl_seconds`（**60～86400 秒**），只能为**仍在库中**的修订（含当前修订、含已迁走路径下残留的历史修订）创建：服务先对对象行加 `FOR UPDATE` 行锁再查修订——与 `/gc` 执行共用同一全局锁序，因此**创建与回收按对象行严格串行**，要么租约先生效（`/gc` 的锁内重判定看到它、保留该修订），要么回收先提交（租约请求得到 404），绝不会"租约成功却丢了修订"。成功返回 **201**、随机租约 ID（32 位十六进制）、数据库时钟计算的 `created_at`/`expires_at` 以及绑定修订的强 ETag（响应头同时带 `ETag`/`Last-Modified`）；修订不存在返回 **404**（`revision_not_found`），参数非法返回 **400**。`GET/HEAD /revision-leases/{id}/content` 按**绑定的旧修订**执行与 `/objects` 完全相同的前置条件（304/412）与 Range/If-Range 规则（200/206/416）；绑定在创建时确定，**路径重新发布、迁移或重放请求都不改变响应**。读取先查租约再对对象行加 `FOR SHARE`、随后复查租约状态与修订是否存在，事务一直持有到最后一个字节——**读取开始后即使租约到期或被释放，流仍完整、元数据始终属于绑定修订**，`/gc` 会等待流结束才能删除。`DELETE /revision-leases/{id}` **幂等释放**：活动、已释放、已过期的租约都返回 204，从未存在的 ID 返回 **404**；释放/过期后再读内容返回 **410**（`lease_released` / `lease_expired`，含路径、修订号与时间戳），修订本身随后才可能被下一次 `/gc` 回收。
 - **对象路径迁移**：`POST /moves` 提交非空且互不相同的 `source_path`、`target_path`、`source_etag`（强 ETag）与正整数 `source_revision_no`；仅当**源强 ETag 与修订号都匹配当前修订、且目标当前无内容**时，按路径升序同时锁住两端，在**一个事务**内把源内容与媒体类型发布为目标的**新修订**（目标侧按自身历史 `max+1` 编号），并把源路径摘除（其 GET/HEAD 随即 **404**）。源不存在（含已迁走）返回 **404**，源已变（ETag 或修订号不符）返回 **412**（响应带当前 ETag/修订号），目标已有内容返回 **409**；任何失败整事务回滚，不留部分生效。已迁走的路径再次 PUT 或作为迁移目标复用时，修订号由每路径高水位线 `revision_seq` 锚定，**只增不复用、不回退**——即便旧修订已被 `/gc` 全部清理。
+- **对象索引（十分钟快照分页）**：`GET /object-index?prefix=&limit=&cursor=` 按路径升序列举当前对象，每条固化 `path`、`revision_no`、`ETag`、`media_type`、`bytes` 五项元数据。`prefix` 可省略（空串表示**全量**），`limit` 缺省 **50**、强制 **1～100**；首次请求由索引模块在**无行锁**的可重复读快照中遍历对象并把结果物化为一份**十分钟快照**（建快照不阻塞任何 PUT、迁移、复制或回收），随后用返回的 `next_cursor` 翻页时先校验 HMAC 签名与其中的 `prefix`、`limit`、快照 ID，再**只回放该快照副本**——翻页期间发生 PUT、路径迁移或历史回收都**不改变、不重复、不遗漏**任何条目；游标伪造、参数非法或与游标不符返回 **400**，快照过期（或已清理）返回 **410**（`snapshot_expired`），重新发起无游标请求即建立新快照。
 
 ## 快速启动（Docker Compose）
 
@@ -47,6 +48,7 @@ curl http://localhost:8000/healthz
 | `POST` | `/revision-leases` | 为仍在库中的（路径, 正整数修订号）创建租约，TTL 60～86400 秒；201 返回随机租约 ID、到期时间与绑定修订 ETag；修订不存在 404，参数非法 400 |
 | `GET` / `HEAD` | `/revision-leases/{id}/content` | 按绑定的旧修订执行条件请求与 Range 规则（200/206/304/412/416）；未知 ID 404，租约过期或已释放 410；读取开始后到期/释放不影响进行中的流 |
 | `DELETE` | `/revision-leases/{id}` | 幂等释放租约（活动/已释放/已过期均 204）；未知 ID 404 |
+| `GET` | `/object-index` | 按路径升序分页列举对象（`prefix` 可空=全量、`limit` 缺省 50/范围 1～100、`cursor` 翻页）；首次建立十分钟快照，之后回放同一快照；非法参数/篡改游标 400，快照过期 410 |
 | `GET` | `/healthz` | 健康检查 |
 
 支持的条件头：`If-Match`、`If-None-Match`、`If-Modified-Since`、`If-Unmodified-Since`（PUT/GET/HEAD 均按 §13.2.2 顺序求值）。
@@ -554,7 +556,98 @@ curl -i http://localhost:8000/revision-leases/00000000000000000000000000000000/c
 # HTTP/1.1 404 Not Found    {"detail":"lease_not_found", ...}
 ```
 
-进行中的大文件读取与释放/回收并发时也是安全的：服务在首字节前对对象行加 `FOR SHARE` 并保持事务到末字节之后，因此读流期间执行 `DELETE` 租约 + `POST /gc`，`/gc` 会等待读取结束；正文一次完整传完后，下一次读取才得到 410、修订才被回收。
+进行中的大文件读取与释放/回收/迁移并发时也是安全的：服务在首字节前对对象行加 `FOR SHARE` 并保持事务到末字节之后，因此读流期间执行 `DELETE` 租约 + `POST /gc`，`/gc` 会等待读取结束；正文一次完整传完后，下一次读取才得到 410、修订才被回收。
+
+## 对象索引（GET /object-index）
+
+按**路径升序**分页列举对象。首次请求（无 `cursor`）建立一份**十分钟快照**：服务在**不取任何行锁**的可重复读事务中遍历当前对象，把每条的 `path`、`revision_no`、`ETag`、`media_type`、`bytes` 复制到独立的快照表；之后携带 `next_cursor` 的每一页都**只回放这份副本**。因此翻页期间发生的 PUT、`POST /moves` 路径迁移或 `POST /gc` 历史回收**不会改变、重复或遗漏**任何一页；建快照本身也**从不阻塞写入**。
+
+查询参数：
+
+| 参数 | 规则 |
+| --- | --- |
+| `prefix` | 可选，字面路径前缀（不是按 `/` 分段匹配）；省略或空串表示**全量**命名空间 |
+| `limit` | 可选，每页条数；缺省 **50**，强制 **1～100**（`0`、`101`、`1.5`、`01`、非数字均 400） |
+| `cursor` | 可选，上一页响应里的 `next_cursor`；签名内含快照 ID、`prefix`、`limit` 与下一页偏移 |
+
+错误：非法参数、伪造/篡改游标、游标与请求的 `prefix`/`limit` 不一致 → **400**；快照超过十分钟（或已被清理）→ **410** `snapshot_expired`，重新发起无游标请求即得到新快照。
+
+```bash
+# 0. 先用 Docker Compose 启动（对象索引随主服务一起提供，无需额外服务）
+docker compose up --build
+curl http://localhost:8000/healthz        # {"status":"ok"}
+
+# 1. 准备几个对象（注意路径顺序与发布顺序无关，索引按路径升序）
+curl -s -X PUT --data-binary 'alpha' -H 'Content-Type: text/plain' \
+  http://localhost:8000/objects/logs/2026/a.log
+curl -s -X PUT --data-binary 'bravo-bytes' \
+  http://localhost:8000/objects/logs/2026/b.log
+curl -s -X PUT --data-binary 'c' -H 'Content-Type: application/json' \
+  http://localhost:8000/objects/logs/2026/c.log
+
+# 2. 首页：prefix=logs/2026/、limit=2（首次请求建立十分钟快照）
+curl -s 'http://localhost:8000/object-index?prefix=logs/2026/&limit=2' | python3 -m json.tool
+# {
+#   "snapshot_id": "7c2e9b1f0a4d4f0a9d3b6a8e2c5f1d77",
+#   "prefix": "logs/2026/",
+#   "limit": 2,
+#   "total": 3,
+#   "offset": 0,
+#   "created_at": "2026-10-03T08:12:00.123456+00:00",
+#   "expires_at": "2026-10-03T08:22:00.123456+00:00",   // created_at + 10 分钟
+#   "entries": [
+#     {"path": "logs/2026/a.log", "revision_no": 1,
+#      "etag": "\"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8\"",
+#      "media_type": "text/plain", "bytes": 5},
+#     {"path": "logs/2026/b.log", "revision_no": 1,
+#      "etag": "\"a8a381fba7803fda4807a6c1c08906d28b2eb9990a2be74af2dc8f643e272151\"",
+#      "media_type": "application/octet-stream", "bytes": 11}
+#   ],
+#   "next_cursor": "eyJ2IjoxLCJzaWQiOiI3YzJlOWIxZj...shortened..."
+# }
+
+# 3. 用 next_cursor 翻下一页（prefix、limit 必须与建快照时一致）
+curl -s "http://localhost:8000/object-index?prefix=logs/2026/&limit=2&cursor=eyJ2IjoxLCJzaWQiOiI3YzJlOWIxZj..." | python3 -m json.tool
+# {
+#   "snapshot_id": "7c2e9b1f0a4d4f0a9d3b6a8e2c5f1d77",   # 同一个快照
+#   ...
+#   "offset": 2,
+#   "entries": [
+#     {"path": "logs/2026/c.log", "revision_no": 1,
+#      "etag": "\"2e7d2c03...\"",
+#      "media_type": "application/json", "bytes": 1}
+#   ],
+#   "next_cursor": null                                 # 遍历结束
+# }
+
+# 4. 重放稳定：即便期间写入，快照内容不变
+curl -s -X PUT --data-binary 'alpha-v2' http://localhost:8000/objects/logs/2026/a.log
+curl -s -X PUT --data-binary 'new-file' http://localhost:8000/objects/logs/2026/d.log
+# 用上一次的 cursor 重放（含回到 offset=0 的重放），仍是 3 条、a.log 仍是 bytes=5；
+# 无 cursor 再请求一次则是新快照（total=4，a.log bytes=8）。
+
+# 5. 全量列举：省略 prefix（或 prefix=）
+curl -s 'http://localhost:8000/object-index' | python3 -m json.tool   # limit 缺省 50
+
+# 6. 参数错误 -> 400
+curl -i 'http://localhost:8000/object-index?limit=0'
+# HTTP/1.1 400 Bad Request
+# {"detail":"limit must be an integer in [1, 100]"}
+curl -i 'http://localhost:8000/object-index?limit=101'          # 400
+curl -i 'http://localhost:8000/object-index?limit=05'           # 400（非规范整数）
+curl -i "http://localhost:8000/object-index?prefix=logs/2026/&limit=2&cursor=forged"
+# HTTP/1.1 400 Bad Request    {"detail":"invalid cursor"}
+# 用别的 prefix/limit 携带旧 cursor 同样 400：
+# {"detail":"cursor does not match the request prefix and limit"}
+
+# 7. 快照过期（建立后超过十分钟）-> 410
+curl -i "http://localhost:8000/object-index?prefix=logs/2026/&limit=2&cursor=<old-cursor>"
+# HTTP/1.1 410 Gone
+# {"detail":"snapshot_expired",
+#  "snapshot_id":"7c2e9b1f0a4d4f0a9d3b6a8e2c5f1d77","ttl_seconds":600}
+```
+
+快照只是元数据的只读副本（不保存正文、也**不**成为 `/gc` 的保留依据）：历史修订在快照期间被回收、对象被 `POST /moves` 迁走，已冻结的索引页照常返回，实时路径读取则按迁移/回收后的现状响应。
 
 ## 本地开发
 
@@ -573,6 +666,8 @@ python -m pytest
 
 - `tests/test_etags.py` / `test_preconditions.py` / `test_ranges.py`：纯逻辑单元测试（ETag 强弱比较、§13.2.2 求值顺序、范围解析与合并、边界确定性）。
 - `tests/test_copy_cursor.py`：复制游标与清单摘要的纯逻辑单元测试（编解码往返、防篡改、确定性）。
+- `tests/test_object_index_cursor.py`：对象索引游标的纯逻辑单元测试（HMAC 编解码往返、空前缀/零偏移、确定性、跨密钥拒绝、篡改/垃圾 token 拒绝）。
+- `tests/test_object_index.py`：`GET /object-index` 端到端测试，覆盖参数校验（`limit` 缺省 50、边界 1/100、`0`/`101`/小数/前导零/非数字 400、重复参数 400）、字面前缀匹配、空前缀全量、路径升序、条目五字段与页大小/偏移、137 条按 `limit=10` 翻页**不重复不遗漏**、翻页期间 PUT（新增+覆盖）/路径迁移/历史回收后仍回放同一快照（首字节重放一致）、快照不成为 `/gc` 保留原因（历史修订照常删除且冻结页仍可读）、篡改游标与 prefix/limit 不符 400、快照过期或被清理 410（载荷区分并可重新建快照）、TTL 恰为 600 秒，以及并发安全：**DB 层确定性验证建快照事务不持有对象行锁（写者 UPDATE 立即获得，带 `lock_timeout`）**、HTTP 层遍历与 40 个并发 PUT 交错时每页快照一致、无重复无遗漏。
 - `tests/test_integration.py`：真实 PostgreSQL + 完整 HTTP 服务的端到端测试，覆盖 200/204/206/304/404/412/416、多段 multipart 确定性、`If-Range`、并发"仅创建"只有一个成功、以及流式传输期间发布新版本不混入内容。
 - `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛，以及**确认与目标首次发布在空占位行上的交错：DB 层确定性复现两种先后顺序（PUT 先 -> 409 非 500、修订号不重复；确认先 -> PUT 等待并接续修订号）+ HTTP 屏障压测两者皆不出现 500/重复修订号**。
 - `tests/test_gc.py`：历史修订回收端到端测试，覆盖请求校验（路径数 1～100、`before`、`dry_run`）、路径不存在整次 404 且执行路径不删任何修订（整批回滚）、空占位行视为不存在、预览分类与零副作用、截止时间的严格小于语义、路径去重与排序、执行后重放返回空清单、修订号不复用继续递增、清单/基线/租约引用保留与原因合并、混合对象只回收未钉住修订且确认仍可应用，以及并发安全：**流式 GET 期间回收等待且不误删在读修订**、回收与 PUT 交错不删新修订且编号连续、回收与确认交错清单钉住的修订必存活、两个并发执行在锁内重判定收敛（每个修订只删一次）。
@@ -594,3 +689,4 @@ python -m pytest
 - **历史修订回收**：`POST /gc` 的执行路径在单事务内先用一条按路径升序的纯 `FOR UPDATE`（不连接 `revisions`、不补占位行）锁定全部请求对象行——与发布、建档（`FOR SHARE`）、确认共用同一全局锁序，彼此串行化而不死锁——再在锁内重新分类：只考虑 `created_at` 严格早于 `before` 的修订，且当前修订、被任何清单或基线引用的修订一律保留，其余同事务删除，任何失败整批回滚。因为重判定发生在锁内，并发 PUT、建档、确认或流式 GET 要么已提交（其结果对分类可见）、要么阻塞到回收提交，所以在用修订不会被误删、外键（`objects.current_id`、清单、基线）不会悬空。当前修订永远是最大修订号且必被保留，`max(revision_no) + 1` 的编号在回收后仍严格递增、不复用旧号。预览（`dry_run`）则在 `REPEATABLE READ` 只读快照中完成存在性检查与分类，不阻塞任何写者。**路径迁移后**，源路径的对象行仍在但 `current_id` 为 NULL：存在性判定把"`current_id` 非空 **或** `revision_seq > 0`"视为存在，所以迁走的路径（包括历史已被全部回收的）始终是合法回收对象、重复执行返回空清单；只有从未有过内容的空占位行（`revision_seq = 0`）才报 404。
 - **对象路径迁移**：`POST /moves` 在单事务内先为两端（按需）插入占位行，再用一条按路径升序的纯 `FOR UPDATE` 同时锁住源与目标的 `objects` 行——与 PUT、建档、确认、回收完全相同的全局锁序，交叉/交换端点的迁移也按同一顺序取锁，串行化而不死锁——锁到手后才 LEFT JOIN `revisions` 读取两端当前修订并按 **404（源无当前修订）→ 412（源强 ETag 或修订号不符）→ 409（目标已有内容）** 顺序判定；全部满足时，把源当前修订的**字节与媒体类型**经 `publish_revision` 作为目标的**全新修订**插入（新的修订 `id`，修订号按目标自身历史 `max+1`），再把源行 `current_id` 置 NULL 摘除——插入新修订与摘除源在同一事务提交，任何失败整批回滚，外部永远看不到部分迁移。迁移不复制修订行本身：它在目标路径新建修订，因此源路径的旧修订行保持原样、仍被迁移前的复制会话清单/基线钉住，`/gc` 据此正常保留。每路径的 `objects.revision_seq` 高水位线在每次发布时随 `revision_no` 一起推进；摘除源行不清零。发布编号取 `GREATEST(revision_seq, max(revision_no)) + 1`，于是已迁走路径（行在但 `current_id` 为 NULL，且其旧修订可被 `/gc` 全部删除）再次 PUT 或作为迁移目标复用时，编号只从旧高水位 +1 继续——绝不回退、绝不复用。
 - **历史修订租约**：`revision_leases(id, object_path, revision_id, revision_no, created_at, expires_at, released_at)` 是 `/gc` 的第四种保留事实，分类 SQL 在锁内多算一个 `EXISTS (... released_at IS NULL AND expires_at > now())`，预览原因记为 `revision_lease`（可与 `current`/`copy_manifest`/`target_baseline` 叠加）。该表**故意不加指向 `revisions` 的外键**：租约过期或释放后修订可以被回收，而租约行必须保留，读取才能回答 410（曾经存在但已失效）而非 404（从未存在）；"租约是否有效"是动态时间谓词，无法由外键表达，一致性改由**对象行锁 + 读取事务持锁到流末**保证（见下）。创建租约在单事务内先用一条**不连接 `revisions` 的纯 `FOR UPDATE`** 锁住对象行（不补占位行——租约不创建对象），锁到手后才按 `(object_path, revision_no)` 查修订：与 `/gc` 执行的"先锁行后分类"在同一全局路径锁序上严格串行——租约先提交则其 INSERT 在 GC 事务快照内可见、修订被保留；GC 先提交则修订已删除、查得 NULL 返回 404，因此"租约成功却丢失修订"在调度上不可达。租约 ID 用 `secrets.token_hex(16)` 随机生成，过期时间由 PostgreSQL `now() + make_interval(secs => ttl)` 计算，与 GC 判定共用同一数据库时钟。内容读取分三步：①无锁读租约行（未知 ID → 404）；②对其 `object_path` 加 `FOR SHARE`；③**锁内复查**租约是否仍未释放且未过期、绑定修订是否仍存在（释放→410 `lease_released`，过期/已回收→410 `lease_expired`），随后复用 `/objects` 的同一套前置条件求值与 Range 计划，并由共享的流式助手在末字节发送后才提交事务。因此一旦读取开始，租约到期、`DELETE` 释放、路径迁移或重新发布都无法改变该响应：GC 的 `FOR UPDATE`/DELETE 会等待 `FOR SHARE` 释放，流完才可能删除；而 HEAD/304/412/416 在同一事务内立即提交。`DELETE` 用 `UPDATE ... WHERE released_at IS NULL AND expires_at > now()` 做条件更新，活动→本次释放、已释放/已过期→幂等 204，仅查无此行才 404。
+- **对象索引快照**：`GET /object-index` 首次请求把 `objects JOIN revisions`（当前修订；INNER JOIN 自然排除已迁走的 `current_id` NULL 行与空占位行）按 `path ASC` 遍历的结果**复制**到 `object_index_snapshots(id, prefix, page_limit, total, created_at, expires_at)` 与 `object_index_entries(snapshot_id, ordinal, path, revision_no, etag, media_type, bytes)`。遍历是普通 `SELECT`、**不带 `FOR SHARE/FOR UPDATE`**，运行在独立的可重复读事务中：建快照**不持有任何对象行锁**，因此 PUT/迁移/确认/回收永不被它阻塞，它也不阻塞它们（DB 层用"遍历事务未提交时写者带 `lock_timeout` 的 UPDATE 立即成功"确定性验证）。`object_index_entries` **故意不引用 `revisions`**：快照只是十分钟的**元数据只读副本**，不是第五种 GC 保留事实——历史修订在翻页期间被 `/gc` 删除、对象被 `POST /moves` 迁走，冻结页照常返回，而实时读写/复制/迁移/回收/租约语义完全不变。翻页只查副本（`(snapshot_id, ordinal)` 索引，`ORDER BY ordinal LIMIT/OFFSET`），偏移由游标承载，因此**不重复、不遗漏、可重放**；末页 `next_cursor` 为 `null`，重放末位置返回相同空页。游标 = HMAC-SHA-256 签名的 `(快照 ID, 偏移, prefix, limit)`，密钥独立存于 `service_meta`（`object_index_cursor_secret`，与复制游标密钥隔离），重启后仍有效；服务端先校验签名，再核对游标内 `prefix`/`limit` 与请求一致、快照头存在且选择一致，任一不符 → 400，快照缺失（从未存在或已清理）或 `expires_at <= now()` → 410。`expires_at` 由 PostgreSQL `now() + interval '10 min'` 计算；每次索引请求顺带 `DELETE ... WHERE expires_at <= now()` 清理过期行（条目随外键级联删除）。TTL（默认 600 秒）、缺省页大小（50）与上限（100）可由 `ORIGIN_OBJECT_INDEX_TTL_SECONDS` / `ORIGIN_OBJECT_INDEX_DEFAULT_LIMIT` / `ORIGIN_OBJECT_INDEX_MAX_LIMIT` 调整。

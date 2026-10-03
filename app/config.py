@@ -16,6 +16,15 @@ GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
 # Allowed lifetime window of a historical-revision lease (seconds).
 LEASE_MIN_TTL = int(os.environ.get("ORIGIN_LEASE_MIN_TTL", "60"))
 LEASE_MAX_TTL = int(os.environ.get("ORIGIN_LEASE_MAX_TTL", "86400"))
+# GET /object-index: default page size, hard page-size cap and the lifetime
+# of a materialised index snapshot (seconds).
+OBJECT_INDEX_DEFAULT_LIMIT = int(
+    os.environ.get("ORIGIN_OBJECT_INDEX_DEFAULT_LIMIT", "50")
+)
+OBJECT_INDEX_MAX_LIMIT = int(os.environ.get("ORIGIN_OBJECT_INDEX_MAX_LIMIT", "100"))
+OBJECT_INDEX_TTL_SECONDS = int(
+    os.environ.get("ORIGIN_OBJECT_INDEX_TTL_SECONDS", "600")
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
@@ -180,4 +189,48 @@ CREATE TABLE IF NOT EXISTS revision_leases (
 CREATE INDEX IF NOT EXISTS revision_leases_revision_active_idx
     ON revision_leases (revision_id)
     WHERE released_at IS NULL;
+
+-- GET /object-index snapshots.  The first request for a given
+-- (prefix, limit) freezes the paths in ascending order into
+-- object_index_entries; later pages and replays read ONLY those rows,
+-- so PUTs, path moves (POST /moves) and historical reclamation
+-- (POST /gc) can never change, duplicate or drop a page of the walk.
+--
+-- The entry table deliberately copies the revision metadata
+-- (revision number, ETag, media type, bytes) and has NO foreign key to
+-- revisions: a snapshot is a self-contained ten-minute read copy, much
+-- like a copy-session manifest, but it must not itself become a GC
+-- retention reason -- snapshots are short-lived metadata-only views, so
+-- /gc remains free to delete the source revision rows while the frozen
+-- entries keep answering replays until expires_at.
+CREATE TABLE IF NOT EXISTS object_index_snapshots (
+    id         text PRIMARY KEY,
+    prefix     text NOT NULL,
+    -- "limit" is a reserved keyword in PostgreSQL; the page size the
+    -- snapshot was created with (replays must echo it).
+    page_limit integer NOT NULL,
+    total      integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS object_index_entries (
+    snapshot_id text NOT NULL REFERENCES object_index_snapshots (id)
+                               ON DELETE CASCADE,
+    ordinal     integer NOT NULL,
+    path        text NOT NULL,
+    revision_no bigint NOT NULL,
+    etag        text NOT NULL,
+    media_type  text NOT NULL,
+    bytes       bigint NOT NULL,
+    PRIMARY KEY (snapshot_id, ordinal)
+);
+
+-- Pages are "ORDER BY ordinal LIMIT $limit OFFSET $offset".
+CREATE INDEX IF NOT EXISTS object_index_entries_page_idx
+    ON object_index_entries (snapshot_id, ordinal);
+
+-- Opportunistic purge of expired snapshots on every index request.
+CREATE INDEX IF NOT EXISTS object_index_snapshots_expires_idx
+    ON object_index_snapshots (expires_at);
 """

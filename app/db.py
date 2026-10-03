@@ -64,6 +64,18 @@ then share-locks its object row and only then re-checks lease liveness
 and revision existence; the transaction and share lock are held until
 the last streamed byte, so expiry/release during a read never tears the
 response, and a DELETE-based release is idempotent.
+
+Object index snapshots (``GET /object-index``) take a different,
+deliberately lock-free path: the first request for a (prefix, limit)
+walks the current objects with a plain unlocked ``SELECT`` (so the
+walk never blocks a writer and a writer never blocks the walk) and
+copies the five metadata fields -- path, revision number, ETag, media
+type, bytes -- into ``object_index_entries`` for ten minutes.  That
+table deliberately has no foreign key to ``revisions``: a frozen
+index is a short-lived read copy, not a GC retention reason, so PUTs,
+path moves and /gc deletions can neither mutate the frozen rows nor be
+blocked by them; paging reads only the copy, which cannot gain, lose or
+reorder a row.
 """
 from __future__ import annotations
 
@@ -1299,3 +1311,205 @@ async def release_revision_lease(conn: asyncpg.Connection, lease_id: str) -> str
         lease_id,
     )
     return "released_now" if updated is not None else "already_released"
+
+
+# ---- object index snapshots ---------------------------------------------------
+
+
+INDEX_SECRET_KEY = "object_index_cursor_secret"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexSnapshot:
+    """One materialised GET /object-index snapshot header."""
+
+    id: str
+    prefix: str
+    limit: int
+    total: int
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IndexEntry:
+    """One frozen index row: the five metadata fields /object-index
+    serves (bytes, never content)."""
+
+    ordinal: int
+    path: str
+    revision_no: int
+    etag: str
+    media_type: str
+    length: int
+
+
+async def ensure_index_secret(pool: asyncpg.Pool) -> str:
+    """Return the HMAC key that signs object-index cursors, creating it once.
+
+    Deliberately a separate key from ``copy_cursor_secret``: a cursor
+    minted for one feature must never validate against the other.
+    """
+    async with pool.acquire() as conn:
+        secret = await conn.fetchval(
+            "SELECT value FROM service_meta WHERE key = $1", INDEX_SECRET_KEY
+        )
+        if secret:
+            return secret
+        await conn.execute(
+            "INSERT INTO service_meta (key, value) VALUES ($1, $2)"
+            " ON CONFLICT (key) DO NOTHING",
+            INDEX_SECRET_KEY,
+            secrets.token_hex(32),
+        )
+        return await conn.fetchval(
+            "SELECT value FROM service_meta WHERE key = $1", INDEX_SECRET_KEY
+        )
+
+
+async def purge_expired_index_snapshots(conn: asyncpg.Connection) -> None:
+    """Best-effort removal of snapshots past their ten-minute lifetime.
+
+    Called at the start of every index request; CASCADE removes their
+    entries too.  Pagination of a purged snapshot then finds no header
+    row and answers 410 -- the semantic equivalent of an expired one.
+    """
+    await conn.execute(
+        "DELETE FROM object_index_snapshots WHERE expires_at <= now()"
+    )
+
+
+async def create_index_snapshot(
+    conn: asyncpg.Connection,
+    snapshot_id: str,
+    prefix: str,
+    limit: int,
+    ttl_seconds: int,
+) -> IndexSnapshot:
+    """Freeze current objects under ``prefix`` into a new snapshot.
+
+    The walk reads the join of ``objects`` and their current revisions
+    with plain ``SELECT`` (no ``FOR SHARE``/``FOR UPDATE``): it takes no
+    row locks, so materialising an index never blocks a concurrent PUT,
+    move, copy acknowledgement or GC, and those writers never block the
+    walk either.  Every statement of the caller's transaction shares one
+    database snapshot, and the selected rows are immediately copied into
+    ``object_index_entries`` -- metadata only (path, revision number,
+    ETag, media type, bytes), deliberately with no foreign key to
+    ``revisions`` -- so later PUTs, moves and reclamation cannot change,
+    duplicate or drop anything the walk froze.  Moved-away paths
+    (``current_id`` NULL) and empty placeholders never had a current
+    revision and are excluded by the INNER JOIN.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT o.path, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length
+          FROM objects o
+          JOIN revisions r ON r.id = o.current_id
+         WHERE ($1 = '' OR strpos(o.path, $1) = 1)
+         ORDER BY o.path ASC
+        """,
+        prefix,
+    )
+    row = await conn.fetchrow(
+        """
+        INSERT INTO object_index_snapshots
+            (id, prefix, page_limit, total, expires_at)
+        VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+        RETURNING id, prefix, page_limit, total, created_at, expires_at
+        """,
+        snapshot_id,
+        prefix,
+        limit,
+        len(rows),
+        ttl_seconds,
+    )
+    await conn.executemany(
+        """
+        INSERT INTO object_index_entries
+            (snapshot_id, ordinal, path, revision_no, etag,
+             media_type, bytes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        [
+            (
+                snapshot_id,
+                ordinal,
+                r["path"],
+                r["revision_no"],
+                f'"{r["sha256"]}"',
+                r["media_type"],
+                r["length"],
+            )
+            for ordinal, r in enumerate(rows)
+        ],
+    )
+    return IndexSnapshot(
+        id=row["id"],
+        prefix=row["prefix"],
+        limit=row["page_limit"],
+        total=row["total"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+async def get_index_snapshot(
+    conn: asyncpg.Connection, snapshot_id: str
+) -> tuple[IndexSnapshot, bool] | None:
+    """Fetch a snapshot header plus its liveness at the database clock.
+
+    Returns None when no row exists (never created, or expired and
+    purged -- both read as 410 to clients); otherwise
+    ``(snapshot, expired)`` so the caller answers 410 for a row that
+    crossed its deadline between the opportunistic purge and this read.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, prefix, page_limit, total, created_at, expires_at,
+               (expires_at <= now()) AS expired
+          FROM object_index_snapshots
+         WHERE id = $1
+        """,
+        snapshot_id,
+    )
+    if row is None:
+        return None
+    return IndexSnapshot(
+        id=row["id"],
+        prefix=row["prefix"],
+        limit=row["page_limit"],
+        total=row["total"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    ), row["expired"]
+
+
+async def fetch_index_page(
+    conn: asyncpg.Connection, snapshot_id: str, offset: int, limit: int
+) -> list[IndexEntry]:
+    """Entries with ordinal >= ``offset`` (0-based), ascending, capped."""
+    rows = await conn.fetch(
+        """
+        SELECT ordinal, path, revision_no, etag, media_type, bytes
+          FROM object_index_entries
+         WHERE snapshot_id = $1 AND ordinal >= $2
+         ORDER BY ordinal ASC
+         LIMIT $3
+        """,
+        snapshot_id,
+        offset,
+        limit,
+    )
+    return [
+        IndexEntry(
+            ordinal=r["ordinal"],
+            path=r["path"],
+            revision_no=r["revision_no"],
+            etag=r["etag"],
+            media_type=r["media_type"],
+            length=r["bytes"],
+        )
+        for r in rows
+    ]

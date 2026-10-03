@@ -42,6 +42,17 @@ new target revision and detaches the source (its GET/HEAD become 404).
 A per-path revision high-water mark keeps numbers monotonic when a
 moved-away path is later re-PUT or reused as a target, even after /gc
 has removed every leftover revision.
+
+The object index (``GET /object-index``) lists current objects in
+ascending path order via ten-minute snapshots.  The first request for a
+(prefix, limit) walks the objects with an unlocked read and
+materialises path, revision number, ETag, media type and bytes of every
+matching current object; every later request carrying the returned
+cursor replays that frozen copy.  Because the copy is a separate,
+revision-free table, concurrent PUTs, path moves and historical
+reclamation never block the walk and never change, repeat or drop a
+page; a tampered or mismatched cursor answers 400, and an expired (or
+purged) snapshot answers 410.
 """
 from __future__ import annotations
 
@@ -65,6 +76,9 @@ from .config import (
     GC_MAX_PATHS,
     LEASE_MAX_TTL,
     LEASE_MIN_TTL,
+    OBJECT_INDEX_DEFAULT_LIMIT,
+    OBJECT_INDEX_MAX_LIMIT,
+    OBJECT_INDEX_TTL_SECONDS,
 )
 from .copy_sessions import (
     CopyCursor,
@@ -76,6 +90,11 @@ from .copy_sessions import (
 )
 from .dates import http_date, parse_http_date
 from .etags import make_etag, parse_etag
+from .object_index import (
+    IndexCursor,
+    decode_cursor as decode_index_cursor,
+    encode_cursor as encode_index_cursor,
+)
 from .preconditions import (
     Outcome,
     RequestConditions,
@@ -180,6 +199,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     dsn = os.environ.get("DATABASE_URL", DATABASE_URL)
     app.state.pool = await database.create_pool(dsn)
     app.state.copy_secret = await database.ensure_copy_secret(app.state.pool)
+    app.state.index_secret = await database.ensure_index_secret(app.state.pool)
     try:
         yield
     finally:
@@ -306,6 +326,197 @@ async def read_object(path: str, request: Request):
     finally:
         if not streaming:
             await pool.release(conn)
+
+
+# ---- object index -------------------------------------------------------------
+
+
+def _index_bad_request(detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=400)
+
+
+def _parse_index_params(request: Request) -> tuple[str, int] | JSONResponse:
+    """Validate ``prefix``/``limit`` raw query parameters.
+
+    Both are parsed from the raw query string so a non-numeric or
+    non-canonical ``limit`` (``"050"``, ``"1.0"``, a repeated key) is a
+    400 rather than being silently coerced by FastAPI.  ``prefix`` is
+    an arbitrary (including empty/unicode) string; absent means "".
+    """
+    raw_prefixes = request.query_params.getlist("prefix")
+    if len(raw_prefixes) > 1:
+        return _index_bad_request("prefix must be given at most once")
+    prefix = raw_prefixes[0] if raw_prefixes else ""
+
+    raw_limits = request.query_params.getlist("limit")
+    if len(raw_limits) > 1:
+        return _index_bad_request("limit must be given at most once")
+    raw_limit = raw_limits[0] if raw_limits else None
+    if raw_limit is None:
+        limit = OBJECT_INDEX_DEFAULT_LIMIT
+    else:
+        # Strict canonical decimal: int("1.0") already fails, but
+        # reject whitespace, signs and leading zeros explicitly.
+        if (
+            not raw_limit.isascii()
+            or not raw_limit.isdigit()
+            or (len(raw_limit) > 1 and raw_limit[0] == "0")
+        ):
+            return _index_bad_request(
+                f"limit must be an integer in [1, {OBJECT_INDEX_MAX_LIMIT}]"
+            )
+        limit = int(raw_limit)
+        if not 1 <= limit <= OBJECT_INDEX_MAX_LIMIT:
+            return _index_bad_request(
+                f"limit must be an integer in [1, {OBJECT_INDEX_MAX_LIMIT}]"
+            )
+    return prefix, limit
+
+
+def _index_gone(snapshot_id: str) -> JSONResponse:
+    # Both "expired" and "already purged / never existed" answer 410:
+    # an opaque cursor never addresses a resource the client can name.
+    return JSONResponse(
+        {
+            "detail": "snapshot_expired",
+            "snapshot_id": snapshot_id,
+            "ttl_seconds": OBJECT_INDEX_TTL_SECONDS,
+        },
+        status_code=410,
+    )
+
+
+def _index_page(snapshot, entries: list, secret: str, next_offset: int):
+    return {
+        "snapshot_id": snapshot.id,
+        "prefix": snapshot.prefix,
+        "limit": snapshot.limit,
+        "total": snapshot.total,
+        "offset": next_offset - len(entries),
+        "created_at": snapshot.created_at.isoformat(),
+        "expires_at": snapshot.expires_at.isoformat(),
+        "entries": [
+            {
+                "path": e.path,
+                "revision_no": e.revision_no,
+                "etag": e.etag,
+                "media_type": e.media_type,
+                "bytes": e.length,
+            }
+            for e in entries
+        ],
+        # null once the walk is complete; replaying the last cursor
+        # returns the same empty final page deterministically.
+        "next_cursor": (
+            encode_index_cursor(
+                secret,
+                IndexCursor(
+                    snapshot_id=snapshot.id,
+                    offset=next_offset,
+                    prefix=snapshot.prefix,
+                    limit=snapshot.limit,
+                ),
+            )
+            if next_offset < snapshot.total
+            else None
+        ),
+    }
+
+
+@app.get("/object-index")
+async def list_object_index(request: Request):
+    """List objects in ascending path order, paged over a 10-minute snapshot.
+
+    Query parameters:
+
+    * ``prefix`` -- optional literal path prefix (byte-for-byte, not a
+      path-segment rule: ``"a"`` also matches ``"ab"``); absent or
+      empty means the whole namespace;
+    * ``limit``  -- optional page size, default 50, forced into 1..100;
+    * ``cursor`` -- opaque token returned as the previous page's
+      ``next_cursor``.
+
+    A request without a cursor materialises a NEW snapshot by walking
+    the current objects with an unlocked read (the walk never blocks a
+    PUT, move or GC, and none of them blocks the walk) and freezes
+    path, revision number, ETag, media type and bytes for ten minutes.
+    A request with a cursor validates the signature and checks that the
+    carried prefix and limit agree with the request parameters and with
+    the stored snapshot; it then replays the FROZEN copy, so PUTs, path
+    moves and historical reclamation between pages neither repeat nor
+    omit entries.  Failures: 400 for an illegal ``limit``/``prefix``
+    parameter or a malformed/tampered/mismatched cursor; 410 when the
+    addressed snapshot has expired (and been purged).
+    """
+    params = _parse_index_params(request)
+    if isinstance(params, JSONResponse):
+        return params
+    prefix, limit = params
+
+    raw_cursors = request.query_params.getlist("cursor")
+    if len(raw_cursors) > 1:
+        return _index_bad_request("cursor must be given at most once")
+    raw_cursor = raw_cursors[0] if raw_cursors else None
+
+    pool = request.app.state.pool
+    secret = request.app.state.index_secret
+
+    cur: IndexCursor | None = None
+    if raw_cursor is not None:
+        cur = decode_index_cursor(secret, raw_cursor)
+        if cur is None:
+            return _index_bad_request("invalid cursor")
+        # The cursor is bound to the query that created the snapshot:
+        # replaying it under a different prefix/page size would make
+        # the walk ambiguous, so answer 400 rather than silently
+        # ignoring either side.
+        if cur.prefix != prefix or cur.limit != limit:
+            return _index_bad_request(
+                "cursor does not match the request prefix and limit"
+            )
+
+    async with pool.acquire() as conn:
+        # One repeatable-read transaction for the whole request: purge,
+        # materialisation/replay and the page read share one database
+        # snapshot (and one transaction-time now()), so a concurrent
+        # purge crossing the expiry boundary can neither remove a page
+        # we have validated as live nor resurrect one that is expired.
+        async with conn.transaction(isolation="repeatable_read"):
+            # Opportunistically reap expired snapshots on every request.
+            await database.purge_expired_index_snapshots(conn)
+            if cur is None:
+                # The walk still takes no row locks (plain SELECT): the
+                # repeatable-read snapshot only freezes the read, it
+                # never blocks a writer, and a concurrent commit is
+                # either wholly in or wholly out of the frozen set.
+                snapshot = await database.create_index_snapshot(
+                    conn,
+                    uuid.uuid4().hex,
+                    prefix,
+                    limit,
+                    OBJECT_INDEX_TTL_SECONDS,
+                )
+                offset = 0
+            else:
+                found = await database.get_index_snapshot(conn, cur.snapshot_id)
+                if found is None:
+                    return _index_gone(cur.snapshot_id)
+                snapshot, expired = found
+                if (
+                    expired
+                    or snapshot.prefix != cur.prefix
+                    or snapshot.limit != cur.limit
+                ):
+                    return _index_gone(cur.snapshot_id)
+                offset = cur.offset
+                if offset < 0 or offset > snapshot.total:
+                    return _index_bad_request("invalid cursor")
+
+            entries = await database.fetch_index_page(
+                conn, snapshot.id, offset, snapshot.limit
+            )
+
+    return _index_page(snapshot, entries, secret, offset + len(entries))
 
 
 @app.put("/objects/{path:path}")
